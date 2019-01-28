@@ -3,12 +3,17 @@ package main
 import (
 	"context"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	auth "github.com/abbot/go-http-auth"
@@ -90,6 +95,16 @@ func main() {
 			Usage:  "The maximum period of having received no request after which the server will shut itself down. Disabled by default.",
 			EnvVar: "BAZEL_REMOTE_IDLE_TIMEOUT",
 		},
+		cli.BoolFlag{
+			Name:   "kill_old_pid",
+			Usage:  "This will kill the existing running bazel-remote process before starting a new bazel-remote process. This when user want to upgrade with a new version",
+			EnvVar: "BAZEL_REMOTE_KILL_OLD",
+		},
+		cli.BoolFlag{
+			Name:   "find_me_a_port",
+			Usage:  "This will find a free port to start bazel-remote server. This will overwrite the port specified in all other places",
+			EnvVar: "BAZEL_REMOTE_FIND_ME_A_PORT",
+		},
 	}
 
 	app.Action = func(ctx *cli.Context) error {
@@ -117,6 +132,11 @@ func main() {
 
 		accessLogger := log.New(os.Stdout, "", log.Ldate|log.Ltime|log.LUTC)
 		errorLogger := log.New(os.Stderr, "", log.Ldate|log.Ltime|log.LUTC)
+
+		if err = writePidFileDuringStartup(c, accessLogger); err != nil {
+			accessLogger.Fatal("Cannot write pid information into bazel_remote.pid file!")
+			return err
+		}
 
 		diskCache := disk.New(c.Dir, int64(c.MaxSize)*1024*1024*1024)
 
@@ -152,9 +172,14 @@ func main() {
 		if c.HtpasswdFile != "" {
 			cacheHandler = wrapAuthHandler(cacheHandler, c.HtpasswdFile, c.Host)
 		}
+
+		// Gracefully shutdown when terminate with ctrl + c
+		cacheHandler = wrapGraceShutdownHandler(cacheHandler, accessLogger, httpServer, c)
+
 		if c.IdleTimeout > 0 {
-			cacheHandler = wrapIdleHandler(cacheHandler, c.IdleTimeout, accessLogger, httpServer)
+			cacheHandler = wrapIdleHandler(cacheHandler, c.IdleTimeout, accessLogger, httpServer, c)
 		}
+
 		mux.HandleFunc("/", cacheHandler)
 
 		if len(c.TLSCertFile) > 0 && len(c.TLSKeyFile) > 0 {
@@ -169,7 +194,7 @@ func main() {
 	}
 }
 
-func wrapIdleHandler(handler http.HandlerFunc, idleTimeout time.Duration, accessLogger cache.Logger, httpServer *http.Server) http.HandlerFunc {
+func wrapIdleHandler(handler http.HandlerFunc, idleTimeout time.Duration, accessLogger cache.Logger, httpServer *http.Server, c *config.Config) http.HandlerFunc {
 	lastRequest := time.Now()
 	ticker := time.NewTicker(time.Second)
 	var m sync.Mutex
@@ -183,6 +208,7 @@ func wrapIdleHandler(handler http.HandlerFunc, idleTimeout time.Duration, access
 				if elapsed > idleTimeout {
 					ticker.Stop()
 					accessLogger.Printf("Shutting down server after having been idle for %v", idleTimeout)
+					removePidInfoBeforeShutDown(accessLogger, c)
 					httpServer.Shutdown(context.Background())
 				}
 			}
@@ -197,8 +223,100 @@ func wrapIdleHandler(handler http.HandlerFunc, idleTimeout time.Duration, access
 	})
 }
 
+func wrapGraceShutdownHandler(handler http.HandlerFunc, accessLogger cache.Logger, httpServer *http.Server, c *config.Config) http.HandlerFunc {
+	signalReceiver := make(chan os.Signal, 1)
+	signal.Notify(signalReceiver, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		select {
+		case sig := <-signalReceiver:
+			accessLogger.Printf("Gracefully shutting down server due to %v signal", sig)
+			removePidInfoBeforeShutDown(accessLogger, c)
+			httpServer.Shutdown(context.Background())
+		}
+	}()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handler(w, r)
+	})
+}
+
 func wrapAuthHandler(handler http.HandlerFunc, htpasswdFile string, host string) http.HandlerFunc {
 	secrets := auth.HtpasswdFileProvider(htpasswdFile)
 	authenticator := auth.NewBasicAuthenticator(host, secrets)
 	return auth.JustCheck(authenticator, handler)
+}
+
+func writePidFileDuringStartup(c *config.Config, accessLogger cache.Logger) error {
+	// create a "pid" directory under cache directory and clean up inactive pid information
+	err := os.MkdirAll(filepath.Join(c.Dir, "pid"), os.FileMode(0744))
+	if err != nil {
+		log.Fatal(err)
+	}
+	pidFile := filepath.Join(c.Dir, "pid", "bazel-remote.pid")
+	if _, err := os.OpenFile(pidFile, syscall.O_RDWR|syscall.O_CREAT, 0644); err != nil {
+		accessLogger.Printf("Could not create or open file: %s due to err: %v", pidFile, err)
+		return err
+	} else {
+		accessLogger.Printf("create or open file: %s", pidFile)
+	}
+
+	fileContent, err := ioutil.ReadFile(pidFile)
+	if err != nil {
+		accessLogger.Printf("Could not read file: %s", pidFile)
+	}
+	lines := strings.Split(string(fileContent), "\n")
+	// clean up inactive pid
+	updatedLines := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if strings.Contains(line, "pid") {
+			words := strings.Split(line, "\t")
+			pid, err := strconv.Atoi(words[1])
+			if err != nil {
+				accessLogger.Printf("Invalid pid: %s", pid)
+			} else {
+				bazelRemoteProcess, err := os.FindProcess(pid)
+				err = bazelRemoteProcess.Signal(syscall.Signal(0))
+				if err != nil {
+					accessLogger.Printf("Removing inactive pid: %d", pid)
+				} else {
+					updatedLines = append(updatedLines, line)
+				}
+			}
+		}
+	}
+	// Write pid and port information into bazel-remote.pid file under cache directory
+	previousPids := []byte(strings.Join(updatedLines, "\n"))
+	currentPid := []byte(
+		"pid" + "\t" + strconv.Itoa(os.Getpid()) + "\t" +
+			"port" + "\t" + strconv.Itoa(c.Port) + "\n")
+	finalData := append(currentPid, previousPids...)
+	err = ioutil.WriteFile(pidFile, finalData, 0644)
+	return err
+}
+
+func removePidInfoBeforeShutDown(accessLogger cache.Logger, c *config.Config) error {
+	pidFile := filepath.Join(c.Dir, "pid", "bazel-remote.pid")
+	fileContent, err := ioutil.ReadFile(pidFile)
+	if err != nil {
+		accessLogger.Printf("Could not read file: %s", pidFile)
+	}
+	lines := strings.Split(string(fileContent), "\n")
+	updatedLines := make([]string, 0, len(lines))
+	// remove current pid information from bazel-remote.pid
+	for _, line := range lines {
+		if strings.Contains(line, "pid") {
+			words := strings.Split(line, "\t")
+			if words[1] == strconv.Itoa(os.Getpid()) {
+				continue
+			}
+			updatedLines = append(updatedLines, line)
+		}
+	}
+	finalData := []byte(strings.Join(updatedLines, "\n"))
+	err = ioutil.WriteFile(pidFile, finalData, 0644)
+	if err == nil {
+		accessLogger.Printf("Successfully updated pid information in bazel_remote.pid")
+	} else {
+		accessLogger.Printf("Update pid information in bazel_remote.pid failed with error: %v", err)
+	}
+	return err
 }

@@ -32,6 +32,8 @@ type Config struct {
 	GoogleCloudStorage *GoogleCloudStorageConfig `yaml:"gcs_proxy"`
 	HTTPBackend        *HTTPBackendConfig        `yaml:"http_proxy"`
 	IdleTimeout        time.Duration             `yaml:"idle_timeout"`
+	KillOldPid         bool                      `yaml:"kill_old_pid"`
+	FindAPortForMe     bool                      `yaml:"find_a_port_for_me"`
 }
 
 // New ...
