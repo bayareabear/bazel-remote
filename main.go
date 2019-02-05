@@ -95,16 +95,6 @@ func main() {
 			Usage:  "The maximum period of having received no request after which the server will shut itself down. Disabled by default.",
 			EnvVar: "BAZEL_REMOTE_IDLE_TIMEOUT",
 		},
-		cli.BoolFlag{
-			Name:   "kill_old_pid",
-			Usage:  "This will kill the existing running bazel-remote process before starting a new bazel-remote process. This when user want to upgrade with a new version",
-			EnvVar: "BAZEL_REMOTE_KILL_OLD",
-		},
-		cli.BoolFlag{
-			Name:   "find_me_a_port",
-			Usage:  "This will find a free port to start bazel-remote server. This will overwrite the port specified in all other places",
-			EnvVar: "BAZEL_REMOTE_FIND_ME_A_PORT",
-		},
 	}
 
 	app.Action = func(ctx *cli.Context) error {
