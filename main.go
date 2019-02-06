@@ -238,6 +238,10 @@ func wrapAuthHandler(handler http.HandlerFunc, htpasswdFile string, host string)
 func writePidFileDuringStartup(c *config.Config, accessLogger cache.Logger) error {
 	// create a bazel-remote.pid file for recording pid information
 	// Lock bazel-remote.pid
+	err := os.MkdirAll(c.Dir, os.FileMode(0755))
+	if err != nil {
+		return err
+	}
 	absolutePath, err := filepath.Abs(c.Dir)
 	if err != nil {
 		return err
@@ -249,9 +253,10 @@ func writePidFileDuringStartup(c *config.Config, accessLogger cache.Logger) erro
 	attempt := 3
 	for err != nil && attempt > 0 {
 		err = pidFileLock.TryLock()
-		time.Sleep(time.Millisecond)
+		time.Sleep(time.Second)
 		attempt--
 	}
+
 	if err != nil {
 		return fmt.Errorf("Lock %q failed: %v", pidFileLock, err)
 	}
@@ -261,20 +266,22 @@ func writePidFileDuringStartup(c *config.Config, accessLogger cache.Logger) erro
 	pidFile := filepath.Join(c.Dir, "bazel-remote.pid")
 	fileContent, err := ioutil.ReadFile(pidFile)
 	if err == nil && len(fileContent) > 0 {
-		pidStr := strings.TrimSuffix(string(fileContent), "\n")
-		pid, err := strconv.Atoi(pidStr)
+		words := strings.Split(string(fileContent), " ")
+		pid, err := strconv.Atoi(words[1])
 		if err == nil {
 			bazelRemoteProcess, err := os.FindProcess(pid)
 			if err = bazelRemoteProcess.Signal(syscall.Signal(0)); err == nil {
-				return fmt.Errorf("A bazel-remote process %d is already running", pid)
+				return fmt.Errorf("A bazel-remote process is already running with %v", string(fileContent))
 			}
 		}
 	}
 
 	// Write pid information into bazel-remote.pid file under cache directory
-	currentPid := []byte(strconv.Itoa(os.Getpid()))
-	accessLogger.Printf("hello current pid: %d", os.Getpid())
-	return ioutil.WriteFile(pidFile, currentPid, 0755)
+	currentPid := []byte(
+		"pid:" + " " + strconv.Itoa(os.Getpid()) + " " +
+			"port:" + " " + strconv.Itoa(c.Port) + "\n")
+	err = ioutil.WriteFile(pidFile, currentPid, 0755)
+	return err
 }
 
 func removePidInfoBeforeShutDown(accessLogger cache.Logger, c *config.Config) error {
@@ -290,7 +297,7 @@ func removePidInfoBeforeShutDown(accessLogger cache.Logger, c *config.Config) er
 	attempt := 3
 	for err != nil && attempt > 0 {
 		err = pidFileLock.TryLock()
-		time.Sleep(time.Millisecond)
+		time.Sleep(time.Second)
 		attempt--
 	}
 	if err != nil {
@@ -299,7 +306,6 @@ func removePidInfoBeforeShutDown(accessLogger cache.Logger, c *config.Config) er
 	defer pidFileLock.Unlock()
 
 	// Delete bazel-remote.pid
-	accessLogger.Printf("remote pid file before shutdown")
 	pidFile := filepath.Join(c.Dir, "bazel-remote.pid")
 	return os.Remove(pidFile)
 }
