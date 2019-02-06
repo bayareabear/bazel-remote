@@ -25,8 +25,8 @@ import (
 
 	"github.com/buchgr/bazel-remote/config"
 	"github.com/buchgr/bazel-remote/server"
+	"github.com/nightlyone/lockfile"
 	"github.com/urfave/cli"
-	"github.com/theckman/go-flock"
 )
 
 func main() {
@@ -125,7 +125,6 @@ func main() {
 		errorLogger := log.New(os.Stderr, "", log.Ldate|log.Ltime|log.LUTC)
 
 		if err = writePidFileDuringStartup(c, accessLogger); err != nil {
-			accessLogger.Fatal("Cannot write pid information into bazel_remote.pid file!")
 			return err
 		}
 
@@ -238,70 +237,69 @@ func wrapAuthHandler(handler http.HandlerFunc, htpasswdFile string, host string)
 
 func writePidFileDuringStartup(c *config.Config, accessLogger cache.Logger) error {
 	// create a bazel-remote.pid file for recording pid information
-	fileLock := flock.New(os.TempDir() + "/bazel-remote.lock")
-	fileLock.TryLock()
-
-	pidFile := filepath.Join(c.Dir, "bazel-remote.pid")
-	if _, err := os.OpenFile(pidFile, syscall.O_RDWR|syscall.O_CREAT, 0755); err != nil {
-		accessLogger.Printf("Could not create or open file: %s due to err: %v", pidFile, err)
-		return err
-	} else {
-		accessLogger.Printf("create or open file: %s", pidFile)
-	}
-	fileContent, err := ioutil.ReadFile(pidFile)
+	// Lock bazel-remote.pid
+	absolutePath, err := filepath.Abs(c.Dir)
 	if err != nil {
-		accessLogger.Printf("Could not read file: %s", pidFile)
+		return err
 	}
-	// clean up inactive pid
-	if fileContent.Contains(line, "pid") {
-		words := strings.Split(line, "\t")
-		pid, err := strconv.Atoi(words[1])
-		if err != nil {
-			accessLogger.Printf("Invalid pid: %s", pid)
-		} else {
+	pidFileLock, err := lockfile.New(filepath.Join(absolutePath, "bazel-remote.pid.lock"))
+	if err != nil {
+		return fmt.Errorf("Init file lock failed: %v", err)
+	}
+	attempt := 3
+	for err != nil && attempt > 0 {
+		err = pidFileLock.TryLock()
+		time.Sleep(time.Millisecond)
+		attempt--
+	}
+	if err != nil {
+		return fmt.Errorf("Lock %q failed: %v", pidFileLock, err)
+	}
+	defer pidFileLock.Unlock()
+
+	// Check if there is an existing process running
+	pidFile := filepath.Join(c.Dir, "bazel-remote.pid")
+	fileContent, err := ioutil.ReadFile(pidFile)
+	if err == nil && len(fileContent) > 0 {
+		pidStr := strings.TrimSuffix(string(fileContent), "\n")
+		pid, err := strconv.Atoi(pidStr)
+		if err == nil {
 			bazelRemoteProcess, err := os.FindProcess(pid)
-			err = bazelRemoteProcess.Signal(syscall.Signal(0))
-			if err != nil {
-				accessLogger.Printf("Removing inactive pid: %d", pid)
-			} else {
-				accessLogger.Printf("A bazel-remote process %d is already running pid", pid)
-				return  errors.New("A bazel-remote process is already running")
+			if err = bazelRemoteProcess.Signal(syscall.Signal(0)); err == nil {
+				return fmt.Errorf("A bazel-remote process %d is already running", pid)
 			}
 		}
 	}
-	// Write pid and port information into bazel-remote.pid file under cache directory
-	currentPid := []byte(
-		"pid" + "\t" + strconv.Itoa(os.Getpid()) + "\t" +
-			"port" + "\t" + strconv.Itoa(c.Port) + "\n")
-	err = ioutil.WriteFile(pidFile, currentPid, 0755)
 
-	fileLock.Unlock()
-	return err
+	// Write pid information into bazel-remote.pid file under cache directory
+	currentPid := []byte(strconv.Itoa(os.Getpid()))
+	accessLogger.Printf("hello current pid: %d", os.Getpid())
+	return ioutil.WriteFile(pidFile, currentPid, 0755)
 }
 
 func removePidInfoBeforeShutDown(accessLogger cache.Logger, c *config.Config) error {
-	fileLock := flock.New(os.TempDir() + "/bazel-remote.lock")
-	fileLock.TryLock()
-	pidFile := filepath.Join(c.Dir, "bazel-remote.pid")
-	fileContent, err := ioutil.ReadFile(pidFile)
+	// Lock bazel-remote.pid
+	absolutePath, err := filepath.Abs(c.Dir)
 	if err != nil {
-		accessLogger.Printf("Could not read file: %s", pidFile)
+		return err
 	}
-	if fileContent.Contains(line, "pid") {
-		words := strings.Split(line, "\t")
-		if words[1] == strconv.Itoa(os.Getpid()) {
+	pidFileLock, err := lockfile.New(filepath.Join(absolutePath, "bazel-remote.pid.lock"))
+	if err != nil {
+		return fmt.Errorf("Init file lock failed: %v", err)
+	}
+	attempt := 3
+	for err != nil && attempt > 0 {
+		err = pidFileLock.TryLock()
+		time.Sleep(time.Millisecond)
+		attempt--
+	}
+	if err != nil {
+		return fmt.Errorf("Lock %q failed: %v", pidFileLock, err)
+	}
+	defer pidFileLock.Unlock()
 
-		} else {
-
-		}
-	}
-	finalData := []byte(strings.Join(updatedLines, "\n"))
-	err = ioutil.WriteFile(pidFile, finalData, 0755)
-	if err == nil {
-		accessLogger.Printf("Successfully updated pid information in bazel_remote.pid")
-	} else {
-		accessLogger.Printf("Update pid information in bazel_remote.pid failed with error: %v", err)
-	}
-	fileLock.Unlock()
-	return err
+	// Delete bazel-remote.pid
+	accessLogger.Printf("remote pid file before shutdown")
+	pidFile := filepath.Join(c.Dir, "bazel-remote.pid")
+	return os.Remove(pidFile)
 }

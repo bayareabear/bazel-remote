@@ -108,3 +108,10 @@ go_repository(
     commit = "3af367b6b30c263d47e8895973edcca9a49cf029",
     importpath = "github.com/google/go-cmp",
 )
+
+go_repository(
+    name = "com_github_nightlyone_lockfile",
+    commit = "0ad87eef1443f64d3d8c50da647e2b1552851124",
+    importpath = "github.com/nightlyone/lockfile",
+)
+
