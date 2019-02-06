@@ -26,6 +26,7 @@ import (
 	"github.com/buchgr/bazel-remote/config"
 	"github.com/buchgr/bazel-remote/server"
 	"github.com/urfave/cli"
+	"github.com/theckman/go-flock"
 )
 
 func main() {
@@ -236,77 +237,71 @@ func wrapAuthHandler(handler http.HandlerFunc, htpasswdFile string, host string)
 }
 
 func writePidFileDuringStartup(c *config.Config, accessLogger cache.Logger) error {
-	// create a "pid" directory under cache directory and clean up inactive pid information
-	err := os.MkdirAll(filepath.Join(c.Dir, "pid"), os.FileMode(0744))
-	if err != nil {
-		log.Fatal(err)
-	}
-	pidFile := filepath.Join(c.Dir, "pid", "bazel-remote.pid")
-	if _, err := os.OpenFile(pidFile, syscall.O_RDWR|syscall.O_CREAT, 0644); err != nil {
+	// create a bazel-remote.pid file for recording pid information
+	fileLock := flock.New(os.TempDir() + "/bazel-remote.lock")
+	fileLock.TryLock()
+
+	pidFile := filepath.Join(c.Dir, "bazel-remote.pid")
+	if _, err := os.OpenFile(pidFile, syscall.O_RDWR|syscall.O_CREAT, 0755); err != nil {
 		accessLogger.Printf("Could not create or open file: %s due to err: %v", pidFile, err)
 		return err
 	} else {
 		accessLogger.Printf("create or open file: %s", pidFile)
 	}
-
 	fileContent, err := ioutil.ReadFile(pidFile)
 	if err != nil {
 		accessLogger.Printf("Could not read file: %s", pidFile)
 	}
-	lines := strings.Split(string(fileContent), "\n")
 	// clean up inactive pid
-	updatedLines := make([]string, 0, len(lines))
-	for _, line := range lines {
-		if strings.Contains(line, "pid") {
-			words := strings.Split(line, "\t")
-			pid, err := strconv.Atoi(words[1])
+	if fileContent.Contains(line, "pid") {
+		words := strings.Split(line, "\t")
+		pid, err := strconv.Atoi(words[1])
+		if err != nil {
+			accessLogger.Printf("Invalid pid: %s", pid)
+		} else {
+			bazelRemoteProcess, err := os.FindProcess(pid)
+			err = bazelRemoteProcess.Signal(syscall.Signal(0))
 			if err != nil {
-				accessLogger.Printf("Invalid pid: %s", pid)
+				accessLogger.Printf("Removing inactive pid: %d", pid)
 			} else {
-				bazelRemoteProcess, err := os.FindProcess(pid)
-				err = bazelRemoteProcess.Signal(syscall.Signal(0))
-				if err != nil {
-					accessLogger.Printf("Removing inactive pid: %d", pid)
-				} else {
-					updatedLines = append(updatedLines, line)
-				}
+				accessLogger.Printf("A bazel-remote process %d is already running pid", pid)
+				return  errors.New("A bazel-remote process is already running")
 			}
 		}
 	}
 	// Write pid and port information into bazel-remote.pid file under cache directory
-	previousPids := []byte(strings.Join(updatedLines, "\n"))
 	currentPid := []byte(
 		"pid" + "\t" + strconv.Itoa(os.Getpid()) + "\t" +
 			"port" + "\t" + strconv.Itoa(c.Port) + "\n")
-	finalData := append(currentPid, previousPids...)
-	err = ioutil.WriteFile(pidFile, finalData, 0644)
+	err = ioutil.WriteFile(pidFile, currentPid, 0755)
+
+	fileLock.Unlock()
 	return err
 }
 
 func removePidInfoBeforeShutDown(accessLogger cache.Logger, c *config.Config) error {
-	pidFile := filepath.Join(c.Dir, "pid", "bazel-remote.pid")
+	fileLock := flock.New(os.TempDir() + "/bazel-remote.lock")
+	fileLock.TryLock()
+	pidFile := filepath.Join(c.Dir, "bazel-remote.pid")
 	fileContent, err := ioutil.ReadFile(pidFile)
 	if err != nil {
 		accessLogger.Printf("Could not read file: %s", pidFile)
 	}
-	lines := strings.Split(string(fileContent), "\n")
-	updatedLines := make([]string, 0, len(lines))
-	// remove current pid information from bazel-remote.pid
-	for _, line := range lines {
-		if strings.Contains(line, "pid") {
-			words := strings.Split(line, "\t")
-			if words[1] == strconv.Itoa(os.Getpid()) {
-				continue
-			}
-			updatedLines = append(updatedLines, line)
+	if fileContent.Contains(line, "pid") {
+		words := strings.Split(line, "\t")
+		if words[1] == strconv.Itoa(os.Getpid()) {
+
+		} else {
+
 		}
 	}
 	finalData := []byte(strings.Join(updatedLines, "\n"))
-	err = ioutil.WriteFile(pidFile, finalData, 0644)
+	err = ioutil.WriteFile(pidFile, finalData, 0755)
 	if err == nil {
 		accessLogger.Printf("Successfully updated pid information in bazel_remote.pid")
 	} else {
 		accessLogger.Printf("Update pid information in bazel_remote.pid failed with error: %v", err)
 	}
+	fileLock.Unlock()
 	return err
 }
