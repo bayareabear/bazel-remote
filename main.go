@@ -302,13 +302,11 @@ func tryLockFile(filePath string, lockAttempt int) (lockfile.Lockfile, error) {
 	if err != nil {
 		return lockfile.Lockfile(""), fmt.Errorf("cannot init lock: %v", err)
 	}
-	for lockAttempt > 0 {
+	err = fileLock.TryLock()
+	for err != nil && lockAttempt > 0 {
 		err = fileLock.TryLock()
 		time.Sleep(time.Second)
 		lockAttempt--
-		if err == nil {
-			break
-		}
 	}
 	if err != nil {
 		return lockfile.Lockfile(""), fmt.Errorf("could not lock %q: %v", fileLock, err)
