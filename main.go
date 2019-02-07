@@ -29,6 +29,12 @@ import (
 	"github.com/urfave/cli"
 )
 
+const (
+	bazelRemotePidFile     = "bazel-remote.pid"
+	bazelRemotePidFileLock = "bazel-remote.pid.lock"
+	tryLockAttempt         = 3
+)
+
 func main() {
 	app := cli.NewApp()
 	app.Description = "A remote build cache for Bazel."
@@ -124,7 +130,8 @@ func main() {
 		accessLogger := log.New(os.Stdout, "", log.Ldate|log.Ltime|log.LUTC)
 		errorLogger := log.New(os.Stderr, "", log.Ldate|log.Ltime|log.LUTC)
 
-		if err = writePidFileDuringStartup(c, accessLogger); err != nil {
+		err = writePidFile(c, accessLogger)
+		if err != nil {
 			return err
 		}
 
@@ -164,10 +171,10 @@ func main() {
 		}
 
 		// Gracefully shutdown when terminate with ctrl + c
-		cacheHandler = wrapGraceShutdownHandler(cacheHandler, accessLogger, httpServer, c)
+		cacheHandler = wrapGracefulShutdownHandler(cacheHandler, accessLogger, httpServer, c.Dir)
 
 		if c.IdleTimeout > 0 {
-			cacheHandler = wrapIdleHandler(cacheHandler, c.IdleTimeout, accessLogger, httpServer, c)
+			cacheHandler = wrapIdleHandler(cacheHandler, c.IdleTimeout, accessLogger, httpServer, c.Dir)
 		}
 
 		mux.HandleFunc("/", cacheHandler)
@@ -184,7 +191,7 @@ func main() {
 	}
 }
 
-func wrapIdleHandler(handler http.HandlerFunc, idleTimeout time.Duration, accessLogger cache.Logger, httpServer *http.Server, c *config.Config) http.HandlerFunc {
+func wrapIdleHandler(handler http.HandlerFunc, idleTimeout time.Duration, accessLogger cache.Logger, httpServer *http.Server, cacheDirectory string) http.HandlerFunc {
 	lastRequest := time.Now()
 	ticker := time.NewTicker(time.Second)
 	var m sync.Mutex
@@ -198,7 +205,7 @@ func wrapIdleHandler(handler http.HandlerFunc, idleTimeout time.Duration, access
 				if elapsed > idleTimeout {
 					ticker.Stop()
 					accessLogger.Printf("Shutting down server after having been idle for %v", idleTimeout)
-					removePidInfoBeforeShutDown(accessLogger, c)
+					removePidFile(accessLogger, cacheDirectory)
 					httpServer.Shutdown(context.Background())
 				}
 			}
@@ -213,14 +220,14 @@ func wrapIdleHandler(handler http.HandlerFunc, idleTimeout time.Duration, access
 	})
 }
 
-func wrapGraceShutdownHandler(handler http.HandlerFunc, accessLogger cache.Logger, httpServer *http.Server, c *config.Config) http.HandlerFunc {
+func wrapGracefulShutdownHandler(handler http.HandlerFunc, accessLogger cache.Logger, httpServer *http.Server, cacheDirectory string) http.HandlerFunc {
 	signalReceiver := make(chan os.Signal, 1)
 	signal.Notify(signalReceiver, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		select {
 		case sig := <-signalReceiver:
 			accessLogger.Printf("Gracefully shutting down server due to %v signal", sig)
-			removePidInfoBeforeShutDown(accessLogger, c)
+			removePidFile(accessLogger, cacheDirectory)
 			httpServer.Shutdown(context.Background())
 		}
 	}()
@@ -235,7 +242,7 @@ func wrapAuthHandler(handler http.HandlerFunc, htpasswdFile string, host string)
 	return auth.JustCheck(authenticator, handler)
 }
 
-func writePidFileDuringStartup(c *config.Config, accessLogger cache.Logger) error {
+func writePidFile(c *config.Config, accessLogger cache.Logger) error {
 	// create a bazel-remote.pid file for recording pid information
 	// Lock bazel-remote.pid
 	err := os.MkdirAll(c.Dir, os.FileMode(0755))
@@ -246,66 +253,63 @@ func writePidFileDuringStartup(c *config.Config, accessLogger cache.Logger) erro
 	if err != nil {
 		return err
 	}
-	pidFileLock, err := lockfile.New(filepath.Join(absolutePath, "bazel-remote.pid.lock"))
+	pidFileLock, err := tryLockFile(filepath.Join(absolutePath, bazelRemotePidFileLock), tryLockAttempt)
 	if err != nil {
-		return fmt.Errorf("Init file lock failed: %v", err)
-	}
-	attempt := 3
-	for err != nil && attempt > 0 {
-		err = pidFileLock.TryLock()
-		time.Sleep(time.Second)
-		attempt--
-	}
-
-	if err != nil {
-		return fmt.Errorf("Lock %q failed: %v", pidFileLock, err)
+		return err
 	}
 	defer pidFileLock.Unlock()
 
 	// Check if there is an existing process running
-	pidFile := filepath.Join(c.Dir, "bazel-remote.pid")
+	pidFile := filepath.Join(c.Dir, bazelRemotePidFile)
 	fileContent, err := ioutil.ReadFile(pidFile)
 	if err == nil && len(fileContent) > 0 {
 		words := strings.Split(string(fileContent), " ")
-		pid, err := strconv.Atoi(words[1])
+		pid, err := strconv.Atoi(words[0])
 		if err == nil {
 			bazelRemoteProcess, err := os.FindProcess(pid)
-			if err = bazelRemoteProcess.Signal(syscall.Signal(0)); err == nil {
-				return fmt.Errorf("A bazel-remote process is already running with %v", string(fileContent))
+			err = bazelRemoteProcess.Signal(syscall.Signal(0))
+			if err == nil {
+				return fmt.Errorf("a bazel-remote process %v is already running with port %v", words[0], words[1])
 			}
 		}
 	}
 
 	// Write pid information into bazel-remote.pid file under cache directory
-	currentPid := []byte(
-		"pid:" + " " + strconv.Itoa(os.Getpid()) + " " +
-			"port:" + " " + strconv.Itoa(c.Port) + "\n")
+	currentPid := []byte(strconv.Itoa(os.Getpid()) + " " + strconv.Itoa(c.Port))
 	err = ioutil.WriteFile(pidFile, currentPid, 0755)
 	return err
 }
 
-func removePidInfoBeforeShutDown(accessLogger cache.Logger, c *config.Config) error {
+func removePidFile(accessLogger cache.Logger, cacheDirectory string) error {
 	// Lock bazel-remote.pid
-	absolutePath, err := filepath.Abs(c.Dir)
+	absolutePath, err := filepath.Abs(cacheDirectory)
 	if err != nil {
 		return err
 	}
-	pidFileLock, err := lockfile.New(filepath.Join(absolutePath, "bazel-remote.pid.lock"))
+	pidFileLock, err := tryLockFile(filepath.Join(absolutePath, bazelRemotePidFileLock), tryLockAttempt)
 	if err != nil {
-		return fmt.Errorf("Init file lock failed: %v", err)
-	}
-	attempt := 3
-	for err != nil && attempt > 0 {
-		err = pidFileLock.TryLock()
-		time.Sleep(time.Second)
-		attempt--
-	}
-	if err != nil {
-		return fmt.Errorf("Lock %q failed: %v", pidFileLock, err)
+		return err
 	}
 	defer pidFileLock.Unlock()
 
 	// Delete bazel-remote.pid
-	pidFile := filepath.Join(c.Dir, "bazel-remote.pid")
+	pidFile := filepath.Join(cacheDirectory, bazelRemotePidFile)
 	return os.Remove(pidFile)
+}
+
+func tryLockFile(filePath string, lockAttempt int) (lockfile.Lockfile, error) {
+	fileLock, err := lockfile.New(filePath)
+	if err != nil {
+		return lockfile.Lockfile(""), fmt.Errorf("cannot init lock: %v", err)
+	}
+	err = nil
+	for err != nil && lockAttempt > 0 {
+		err = fileLock.TryLock()
+		time.Sleep(time.Second)
+		lockAttempt--
+	}
+	if err != nil {
+		return lockfile.Lockfile(""), fmt.Errorf("could not lock %q: %v", fileLock, err)
+	}
+	return fileLock, nil
 }
