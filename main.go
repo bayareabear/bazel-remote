@@ -306,7 +306,7 @@ func tryLockFile(filePath string, lockAttempt int) (lockfile.Lockfile, error) {
 		err = fileLock.TryLock()
 		time.Sleep(time.Second)
 		lockAttempt--
-		if err != nil {
+		if err == nil {
 			break
 		}
 	}
