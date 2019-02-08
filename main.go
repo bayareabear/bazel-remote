@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -34,6 +35,20 @@ const (
 	bazelRemotePidFileLock = "bazel-remote.pid.lock"
 	tryLockAttempt         = 3
 )
+
+type tcpKeepAliveListener struct {
+	*net.TCPListener
+}
+
+func (ln tcpKeepAliveListener) Accept() (net.Conn, error) {
+	tc, err := ln.AcceptTCP()
+	if err != nil {
+		return nil, err
+	}
+	tc.SetKeepAlive(true)
+	tc.SetKeepAlivePeriod(3 * time.Minute)
+	return tc, nil
+}
 
 func main() {
 	app := cli.NewApp()
@@ -129,12 +144,6 @@ func main() {
 
 		accessLogger := log.New(os.Stdout, "", log.Ldate|log.Ltime|log.LUTC)
 		errorLogger := log.New(os.Stderr, "", log.Ldate|log.Ltime|log.LUTC)
-
-		err = writePidFile(c, accessLogger)
-		if err != nil {
-			return err
-		}
-
 		diskCache := disk.New(c.Dir, int64(c.MaxSize)*1024*1024*1024)
 
 		var proxyCache cache.Cache
@@ -178,13 +187,20 @@ func main() {
 		}
 
 		mux.HandleFunc("/", cacheHandler)
-
-		if len(c.TLSCertFile) > 0 && len(c.TLSKeyFile) > 0 {
-			return httpServer.ListenAndServeTLS(c.TLSCertFile, c.TLSKeyFile)
+		ln, err := net.Listen("tcp", c.Host+":"+strconv.Itoa(c.Port))
+		if err != nil {
+			return err
 		}
-		return httpServer.ListenAndServe()
+		defer ln.Close()
+		err = writePidFile(c.Dir, c.Port)
+		if err != nil {
+			return err
+		}
+		if len(c.TLSCertFile) > 0 && len(c.TLSKeyFile) > 0 {
+			return httpServer.ServeTLS(tcpKeepAliveListener{ln.(*net.TCPListener)}, c.TLSCertFile, c.TLSKeyFile)
+		}
+		return httpServer.Serve(tcpKeepAliveListener{ln.(*net.TCPListener)})
 	}
-
 	serverErr := app.Run(os.Args)
 	if serverErr != nil {
 		log.Fatal("bazel-remote terminated: ", serverErr)
@@ -205,7 +221,7 @@ func wrapIdleHandler(handler http.HandlerFunc, idleTimeout time.Duration, access
 				if elapsed > idleTimeout {
 					ticker.Stop()
 					accessLogger.Printf("Shutting down server after having been idle for %v", idleTimeout)
-					removePidFile(accessLogger, cacheDirectory)
+					removePidFile(cacheDirectory)
 					httpServer.Shutdown(context.Background())
 				}
 			}
@@ -227,7 +243,7 @@ func wrapGracefulShutdownHandler(handler http.HandlerFunc, accessLogger cache.Lo
 		select {
 		case sig := <-signalReceiver:
 			accessLogger.Printf("Gracefully shutting down server due to %v signal", sig)
-			removePidFile(accessLogger, cacheDirectory)
+			removePidFile(cacheDirectory)
 			httpServer.Shutdown(context.Background())
 		}
 	}()
@@ -242,14 +258,14 @@ func wrapAuthHandler(handler http.HandlerFunc, htpasswdFile string, host string)
 	return auth.JustCheck(authenticator, handler)
 }
 
-func writePidFile(c *config.Config, accessLogger cache.Logger) error {
+func writePidFile(cachDirectory string, port int) error {
 	// create a bazel-remote.pid file for recording pid information
 	// Lock bazel-remote.pid
-	err := os.MkdirAll(c.Dir, os.FileMode(0755))
+	err := os.MkdirAll(cachDirectory, os.FileMode(0755))
 	if err != nil {
 		return err
 	}
-	absolutePath, err := filepath.Abs(c.Dir)
+	absolutePath, err := filepath.Abs(cachDirectory)
 	if err != nil {
 		return err
 	}
@@ -260,7 +276,7 @@ func writePidFile(c *config.Config, accessLogger cache.Logger) error {
 	defer pidFileLock.Unlock()
 
 	// Check if there is an existing process running
-	pidFile := filepath.Join(c.Dir, bazelRemotePidFile)
+	pidFile := filepath.Join(cachDirectory, bazelRemotePidFile)
 	fileContent, err := ioutil.ReadFile(pidFile)
 	if err == nil && len(fileContent) > 0 {
 		words := strings.Split(string(fileContent), " ")
@@ -275,12 +291,12 @@ func writePidFile(c *config.Config, accessLogger cache.Logger) error {
 	}
 
 	// Write pid information into bazel-remote.pid file under cache directory
-	currentPid := []byte(strconv.Itoa(os.Getpid()) + " " + strconv.Itoa(c.Port))
+	currentPid := []byte(strconv.Itoa(os.Getpid()) + " " + strconv.Itoa(port))
 	err = ioutil.WriteFile(pidFile, currentPid, 0755)
 	return err
 }
 
-func removePidFile(accessLogger cache.Logger, cacheDirectory string) error {
+func removePidFile(cacheDirectory string) error {
 	// Lock bazel-remote.pid
 	absolutePath, err := filepath.Abs(cacheDirectory)
 	if err != nil {
