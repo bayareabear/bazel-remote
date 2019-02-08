@@ -180,7 +180,7 @@ func main() {
 		}
 
 		// Gracefully shutdown when terminate with ctrl + c
-		cacheHandler = wrapGracefulShutdownHandler(cacheHandler, accessLogger, httpServer, c.Dir)
+		wrapGracefulShutdown(accessLogger, httpServer, c.Dir)
 
 		if c.IdleTimeout > 0 {
 			cacheHandler = wrapIdleHandler(cacheHandler, c.IdleTimeout, accessLogger, httpServer, c.Dir)
@@ -236,7 +236,7 @@ func wrapIdleHandler(handler http.HandlerFunc, idleTimeout time.Duration, access
 	})
 }
 
-func wrapGracefulShutdownHandler(handler http.HandlerFunc, accessLogger cache.Logger, httpServer *http.Server, cacheDirectory string) http.HandlerFunc {
+func wrapGracefulShutdown(accessLogger cache.Logger, httpServer *http.Server, cacheDirectory string) {
 	signalReceiver := make(chan os.Signal, 1)
 	signal.Notify(signalReceiver, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -247,9 +247,6 @@ func wrapGracefulShutdownHandler(handler http.HandlerFunc, accessLogger cache.Lo
 			httpServer.Shutdown(context.Background())
 		}
 	}()
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		handler(w, r)
-	})
 }
 
 func wrapAuthHandler(handler http.HandlerFunc, htpasswdFile string, host string) http.HandlerFunc {
