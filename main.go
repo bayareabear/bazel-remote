@@ -36,6 +36,7 @@ const (
 	tryLockAttempt         = 3
 )
 
+//http doesn't export tcpKeepAliveListener so we have to do the same here
 type tcpKeepAliveListener struct {
 	*net.TCPListener
 }
